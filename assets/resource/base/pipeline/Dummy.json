@@ -32,6 +32,7 @@
         "doc": "【全局默认空on_error覆盖】Jumpback链路崩毁默认节点",
         "pre_delay": 0,
         "post_delay": 0,
+        "on_error": [],
         "next": [
             "全局-战前吃体力",
             "风暴罐不足",
