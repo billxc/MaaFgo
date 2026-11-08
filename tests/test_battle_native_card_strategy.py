@@ -8,16 +8,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "agent"), str(ROOT / "agent/custom")]
 
 from battle.core.decider import RuleDecider, _best_face_order, _native_card_score
-from battle.core.enums import CardColor as Color, PrimitiveKind as Kind, Scene
+from battle.core.enums import CardAffinity as Affinity, CardColor as Color, PrimitiveKind as Kind, Scene
 from battle.core.models import BattleState, CardPick, CommandCard, Confidence, NpCard
 from battle.core.plan_parser import _parse_battle_policy
 from battle.core.policy import CardPolicy, NativeCardStrategy
 from battle.data.chaldea_converter import convert_chaldea_actions_to_battle_plan
 
 
-def face(slot, color=Color.BUSTER, owner=None, sid=None, *, blocked=False):
+def face(slot, color=Color.BUSTER, owner=None, sid=None, *, blocked=False, affinity=Affinity.NORMAL):
     return CommandCard(slot, color, owner, Confidence(1),
-                       owner_servant_id=sid, can_attack=not blocked)
+                       owner_servant_id=sid, can_attack=not blocked, affinity=affinity)
 
 
 def state(cards, nps=()):
@@ -323,6 +323,26 @@ class NativeStrategyDecisionTests(unittest.TestCase):
         unknown = replace(base, np_cards=(replace(base.np_cards[0], owner_servant_id=None),))
         slot_config = replace(config, native_strategy=replace(config.native_strategy, np_colors_by_slot=((2, Color.ARTS),)))
         self.assertEqual(deduction(unknown, slot_config), 0)
+
+    def test_affinity_prefers_weak_and_avoids_resist_in_both_strategies(self):
+        cards = (
+            face(1, Color.BUSTER, affinity=Affinity.RESIST),
+            face(2, Color.BUSTER, affinity=Affinity.RESIST),
+            face(3, Color.QUICK, affinity=Affinity.WEAK),
+            face(4, Color.ARTS, affinity=Affinity.WEAK),
+            face(5, Color.QUICK, affinity=Affinity.NORMAL),
+        )
+        # Legacy _best_face_order prefers WEAK/NORMAL over RESIST
+        legacy_slots = _best_face_order(cards, 3, CardPolicy(prefer_mighty_chain=False))
+        self.assertEqual(legacy_slots[:2], [4, 3])
+        self.assertNotIn(1, legacy_slots)
+        self.assertNotIn(2, legacy_slots)
+
+        # NativeCardStrategy prefers WEAK and avoids RESIST
+        native_picks = RuleDecider(replace(policy(prefer_brave_chain=False, mighty_chain_weight=0, same_color_chain_weight=0), prefer_mighty_chain=False)).decide(
+            state(cards)
+        ).picks
+        self.assertEqual([p.slot for p in native_picks], [4, 3, 5])
 
 
 if __name__ == "__main__":

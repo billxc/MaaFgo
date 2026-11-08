@@ -1,5 +1,35 @@
 {
   "option": {
+    "原生自动战斗引擎模式": {
+      "type": "select",
+      "label": "战斗识别与执行引擎",
+      "description": "切换 FGA 极速模式（跳过冗余技能CD识别、零OCR快速放技能、OpenCV克制与色卡识别）与原版兼容模式（引入 FGA 前的完整模板/OCR流程），并在日志中输出每回合耗时对比。",
+      "default": "fga",
+      "cases": [
+        {
+          "name": "fga",
+          "label": "⚡ FGA 极速模式（默认）",
+          "pipeline_override": {
+            "原生自动战斗-高级策略配置": {
+              "attach": {
+                "native_battle_fga_fast": true
+              }
+            }
+          }
+        },
+        {
+          "name": "legacy",
+          "label": "🐢 原版模式（引入 FGA 前，用于对比测试）",
+          "pipeline_override": {
+            "原生自动战斗-高级策略配置": {
+              "attach": {
+                "native_battle_fga_fast": false
+              }
+            }
+          }
+        }
+      ]
+    },
     "原生自动战斗高级策略": {
       "type": "select",
       "label": "高级策略",

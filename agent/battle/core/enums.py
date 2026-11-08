@@ -20,6 +20,12 @@ class CardColor(str, Enum):
     QUICK = "Q"
 
 
+class CardAffinity(str, Enum):
+    NORMAL = "normal"
+    WEAK = "weak"
+    RESIST = "resist"
+
+
 class PrimitiveKind(str, Enum):
     SELECT_ENEMY = "select_enemy"
     SELECT_CARD = "select_card"   # 下排面卡

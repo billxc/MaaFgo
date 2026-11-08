@@ -228,13 +228,25 @@ class AutoBattleRepeatAction(CustomAction):
                 }
             })
         else:
+            last_summary = ""
+            try:
+                node_data = context.get_node_data("原生自动战斗-高级策略配置") or {}
+                attach = node_data.get("attach") if isinstance(node_data, dict) else None
+                if isinstance(attach, dict) and isinstance(attach.get("last_battle_summary"), str):
+                    last_summary = attach["last_battle_summary"]
+            except Exception:
+                pass
+            summary_html = (
+                f'<br><span style="color: #666; font-size: 0.9em;">{html.escape(last_summary)}</span>'
+                if last_summary else ""
+            )
             context.override_pipeline({
                 "bbc弹窗信息输出": {
                     "focus": {
                         "Node.Recognition.Starting":
                             f'<span style="color: #008000;">'
                             f'原生自动战斗完成：共 {success_count} 场'
-                            f'</span>'
+                            f'</span>{summary_html}'
                     }
                 }
             })

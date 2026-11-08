@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "agent"), str(ROOT / "agent" / "custom")]
 
 from battle.core.enums import Scene
-from battle.runtime.runtime import AutoBattleRuntime
+from battle.runtime.runtime import AutoBattleRuntime, _MAIN_BATTLE_SETTLE_S
 
 
 class BattleMainSettleTest(unittest.TestCase):
@@ -46,7 +46,7 @@ class BattleMainSettleTest(unittest.TestCase):
             return Scene.MAIN_BATTLE
 
         def sleep(seconds):
-            self.assertEqual(seconds, 1.0)
+            self.assertEqual(seconds, _MAIN_BATTLE_SETTLE_S)
             events.append("sleep")
 
         def build(_context, image):
@@ -75,6 +75,53 @@ class BattleMainSettleTest(unittest.TestCase):
         sleep.assert_not_called()
         build.assert_called_once_with(runtime.ctx, frame)
         self.assertEqual(events, ["screenshot"])
+
+    def test_active_plan_and_enemy_target_wait_pass_skip_skill_cd_when_supported(self):
+        from battle.core.models import BattlePlan, BattleState, Confidence, TurnPlan
+
+        frame = object()
+        events = []
+        runtime = self._runtime([frame], events)
+        runtime.decider = SimpleNamespace(plan=BattlePlan(turns=(TurnPlan(),)))
+        runtime._turn_index = 0
+        runtime.roster_servant_ids = (None,) * 6
+        runtime.candidate_servant_ids = ()
+        state = BattleState(Scene.MAIN_BATTLE, Confidence(1.0), (), (), ())
+
+        calls = []
+
+        def build(_context, image, *, skip_skill_cd=False, **kwargs):
+            calls.append((image, skip_skill_cd, kwargs))
+            return state
+
+        with patch("battle.runtime.runtime.perception.build", side_effect=build):
+            runtime._observe()
+
+        self.assertEqual(calls, [(frame, True, {})])
+
+    def test_legacy_mode_disables_skip_skill_cd_and_fga_fast_in_observe(self):
+        from battle.core.models import BattlePlan, BattleState, Confidence, TurnPlan
+
+        frame = object()
+        events = []
+        runtime = self._runtime([frame], events)
+        runtime.fga_fast = False
+        runtime.decider = SimpleNamespace(plan=BattlePlan(turns=(TurnPlan(),)))
+        runtime._turn_index = 0
+        runtime.roster_servant_ids = (None,) * 6
+        runtime.candidate_servant_ids = ()
+        state = BattleState(Scene.MAIN_BATTLE, Confidence(1.0), (), (), ())
+
+        calls = []
+
+        def build(_context, image, *, skip_skill_cd=False, fga_fast=True, **kwargs):
+            calls.append((image, skip_skill_cd, fga_fast, kwargs))
+            return state
+
+        with patch("battle.runtime.runtime.perception.build", side_effect=build):
+            runtime._observe()
+
+        self.assertEqual(calls, [(frame, False, False, {})])
 
 
 if __name__ == "__main__":

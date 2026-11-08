@@ -16,12 +16,13 @@ from typing import List, Optional, Sequence, Tuple
 
 import mfaalog
 
-from ..core.enums import CardColor, Scene
+from ..core.enums import CardAffinity, CardColor, Scene
 from ..core.models import (BattleState, CommandCard, Confidence, EnemyState,
                            NpCard, ServantState, SkillState)
 from . import config
 from .card_owner import CommandCardOwnerRecognizer
 from .composed_card import ComposedCardRecognizer
+from .fga_card_vision import detect_all_card_affinities, detect_card_affinity, detect_card_color_fast
 from .frontline import FrontlineServantRecognizer
 
 
@@ -36,8 +37,15 @@ def build(
     servant_recognizer: FrontlineServantRecognizer | None = None,
     composed_recognizer: ComposedCardRecognizer | None = None,
     enemy_slots: Sequence[int] | None = None,
+    skip_skill_cd: bool = False,
+    fga_fast: bool = True,
 ) -> BattleState:
-    scene, sconf = _detect_scene(context, img)
+    # 当仅用于技能间敌方目标复核 (enemy_slots is not None and skip_skill_cd) 且启用 fga_fast 时，
+    # 不需要执行耗时 ~150ms 的「战斗_换人界面」大范围 OCR。
+    if fga_fast and enemy_slots is not None and skip_skill_cd:
+        scene, sconf = _detect_scene(context, img, check_order_change=False)
+    else:
+        scene, sconf = _detect_scene(context, img)
 
     # 只有选卡界面才需要解析卡牌；主界面/动画等无卡可读
     cards: Tuple[CommandCard, ...] = ()
@@ -60,10 +68,12 @@ def build(
                 faces, nps = recognizer.detect(img, roster), recognizer.detect_np(img, roster)
             composed_faces = {item.ui_slot: item for item in faces}
             np_owners = {item.ui_slot: item for item in nps}
+        affinities = detect_all_card_affinities(img) if fga_fast else {}
         card_states = []
         for i in range(1, 6):
             blocked = _reco(context, config.FACE_BLOCKED_NODE.format(ui_slot=i), img)
             is_blocked = bool(blocked and blocked.hit)
+            affinity = affinities.get(i, CardAffinity.NORMAL)
             composed = composed_faces.get(i)
             if composed and composed.visual_present and composed.color is not None:
                 card = CommandCard(
@@ -73,9 +83,10 @@ def build(
                     owner_margin=composed.margin,
                     owner_template=composed.matched_template,
                     owner_reason=composed.reason,
+                    affinity=affinity,
                 )
             else:
-                card = _detect_card(context, img, i)
+                card = _detect_card(context, img, i, affinity=affinity, fga_fast=fga_fast)
             card_states.append(replace(
                 card, can_attack=not is_blocked,
                 blocked_reason="sealed_or_cannot_act" if is_blocked else "",
@@ -111,20 +122,25 @@ def build(
             if c.owner_slot is None:
                 unknown.append(f"card[{c.ui_slot}].owner_slot")
     elif scene is Scene.MAIN_BATTLE:
-        servants = _detect_servants(
-            context, img, candidate_servant_ids or frontline_servant_ids or (),
-            recognizer=servant_recognizer,
-        )
-        for servant in servants:
-            for index, skill in enumerate(servant.skills, start=1):
+        if fga_fast and enemy_slots is not None and skip_skill_cd:
+            servants = ()
+            master_skills = ()
+        else:
+            servants = _detect_servants(
+                context, img, candidate_servant_ids or frontline_servant_ids or (),
+                recognizer=servant_recognizer,
+                skip_skill_cd=skip_skill_cd,
+            )
+            for servant in servants:
+                for index, skill in enumerate(servant.skills, start=1):
+                    if skill.available is None:
+                        unknown.append(
+                            f"servant[{servant.slot}].skill[{index}].available"
+                        )
+            master_skills = _detect_master_skills(context, img, skip_skill_cd=skip_skill_cd)
+            for index, skill in enumerate(master_skills, start=1):
                 if skill.available is None:
-                    unknown.append(
-                        f"servant[{servant.slot}].skill[{index}].available"
-                    )
-        master_skills = _detect_master_skills(context, img)
-        for index, skill in enumerate(master_skills, start=1):
-            if skill.available is None:
-                unknown.append(f"master_skill[{index}].available")
+                    unknown.append(f"master_skill[{index}].available")
     elif scene is Scene.ORDER_CHANGE:
         # 换人界面：检测从者技能状态无意义，只识别场景即可
         pass
@@ -180,18 +196,48 @@ _CARD_TEXT_MAP = {
     "quick": CardColor.QUICK,
 }
 
-def _detect_card(context, img, ui_slot: int) -> CommandCard:
+def _detect_card(
+    context,
+    img,
+    ui_slot: int,
+    *,
+    affinity: CardAffinity | None = None,
+    fga_fast: bool = True,
+) -> CommandCard:
+    resolved_affinity = (
+        affinity if affinity is not None
+        else (detect_card_affinity(img, ui_slot) if fga_fast else CardAffinity.NORMAL)
+    )
+    if fga_fast:
+        fast = detect_card_color_fast(img, ui_slot)
+        if fast.color is not CardColor.UNKNOWN and fast.confidence.passes(config.MIN_CARD_CONFIDENCE):
+            return CommandCard(
+                ui_slot,
+                fast.color,
+                owner_slot=None,
+                confidence=fast.confidence,
+                affinity=resolved_affinity,
+            )
     # 国服卡牌文字为中文，日服为英文；只接受完整卡色词，不猜测 OCR 噪声。
     node = config.CARD_NODE.format(ui_slot=ui_slot)
     r = _reco(context, node, img)
     if not r or not r.hit or not r.best_result:
-        return CommandCard(ui_slot, CardColor.UNKNOWN, None, Confidence(0.0, "ocr"))
+        return CommandCard(
+            ui_slot, CardColor.UNKNOWN, None, Confidence(0.0, "ocr"),
+            affinity=resolved_affinity,
+        )
     text = getattr(r.best_result, "text", "") or ""
     score = getattr(r.best_result, "score", 1.0) or 1.0
     color = _CARD_TEXT_MAP.get(text.strip().casefold())
     if color is None:
-        return CommandCard(ui_slot, CardColor.UNKNOWN, None, Confidence(0.0, "ocr"))
-    return CommandCard(ui_slot, color, owner_slot=None, confidence=Confidence(float(score), "ocr"))
+        return CommandCard(
+            ui_slot, CardColor.UNKNOWN, None, Confidence(0.0, "ocr"),
+            affinity=resolved_affinity,
+        )
+    return CommandCard(
+        ui_slot, color, owner_slot=None, confidence=Confidence(float(score), "ocr"),
+        affinity=resolved_affinity,
+    )
 
 
 def _detect_np(context, img, servant_slot: int, owner=None) -> Optional[NpCard]:
@@ -260,7 +306,14 @@ def _count(reco) -> int:
     return int(getattr(best, "count", 0) or 0)
 
 
-def _detect_servants(context, img, candidate_servant_ids=(), *, recognizer=None) -> Tuple[ServantState, ...]:
+def _detect_servants(
+    context,
+    img,
+    candidate_servant_ids=(),
+    *,
+    recognizer=None,
+    skip_skill_cd: bool = False,
+) -> Tuple[ServantState, ...]:
     """先识别各位置的战斗头像，再检测已确认从者的技能 CD。
 
     头像未匹配时按空位处理，不识别或使用该位置的技能。
@@ -279,22 +332,29 @@ def _detect_servants(context, img, candidate_servant_ids=(), *, recognizer=None)
         if identity.servant_id is None:
             continue
         slot = identity.slot
-        skills: List[SkillState] = []
+        if skip_skill_cd:
+            skills = tuple(
+                SkillState(True, Confidence(1.0, "plan:skip_cd"))
+                for _ in range(3)
+            )
+            out.append(ServantState(slot, skills, identity.confidence, identity.servant_id))
+            continue
+        skills_list: List[SkillState] = []
         for idx in range(1, 4):
             cd_node = config.SERVANT_SKILL_CD_NODE.format(servant_slot=slot, skill_index=idx)
             cd_result = _reco(context, cd_node, img)
             if cd_result and cd_result.hit:
                 # 命中 CD 数字模板 → 技能在冷却，不可用。
                 score = getattr(getattr(cd_result, "best_result", None), "score", 1.0) or 1.0
-                skills.append(SkillState(False, Confidence(float(score), "template:cd")))
+                skills_list.append(SkillState(False, Confidence(float(score), "template:cd")))
                 continue
             # 未命中任何 CD 数字 → 技能可用。
-            skills.append(SkillState(True, Confidence(1.0, "template:no_cd")))
-        out.append(ServantState(slot, tuple(skills), identity.confidence, identity.servant_id))
+            skills_list.append(SkillState(True, Confidence(1.0, "template:no_cd")))
+        out.append(ServantState(slot, tuple(skills_list), identity.confidence, identity.servant_id))
     return tuple(out)
 
 
-def _detect_master_skills(context, img) -> Tuple[SkillState, ...]:
+def _detect_master_skills(context, img, *, skip_skill_cd: bool = False) -> Tuple[SkillState, ...]:
     """检测御主技能 1..3 的可用性。
 
     识别逻辑与从者技能一致：TemplateMatch 命中 CD 数字模板 → 不可用；
@@ -303,6 +363,11 @@ def _detect_master_skills(context, img) -> Tuple[SkillState, ...]:
     无数字 → 不命中 → 判定为可用。这是保守行为：若技能实际在冷却但
     菜单收起，会误判为可用，由执行层/安全门兜底。
     """
+    if skip_skill_cd:
+        return tuple(
+            SkillState(True, Confidence(1.0, "plan:skip_cd"))
+            for _ in range(3)
+        )
     out: List[SkillState] = []
     for idx in range(1, 4):
         cd_node = config.MASTER_SKILL_CD_NODE.format(skill_index=idx)

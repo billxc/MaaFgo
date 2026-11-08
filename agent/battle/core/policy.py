@@ -52,6 +52,8 @@ class NativeCardStrategy:
     # It only scores fill candidates; explicit plan cards always stay fixed.
     avoid_np_color_before_np: bool = False
     np_color_preservation_weight: float = 20.0
+    weak_weight: float = 5.0
+    resist_penalty: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,8 @@ class CardPolicy:
     color_priority: Tuple[CardColor, ...] = (CardColor.BUSTER, CardColor.ARTS, CardColor.QUICK)
     np_first: bool = True                 # 有宝具卡则优先出
     prefer_mighty_chain: bool = True      # 三色连锁（红蓝绿各一张）优先
+    weak_weight: float = 5.0
+    resist_penalty: float = 5.0
     native_strategy: NativeCardStrategy = field(default_factory=NativeCardStrategy)
 
 

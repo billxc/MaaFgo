@@ -10,12 +10,13 @@
 """
 from __future__ import annotations
 
+import inspect
 import time
 from collections import Counter
 from dataclasses import dataclass, replace
 
 from ..core.decider import Decider, RuleDecider
-from ..core.special_skills import SpecialSkillChoiceError
+from ..core.special_skills import SPECIAL_SKILL_GROUPS, SpecialSkillChoiceError
 from .special_skills import SpecialSkillDispatcher
 from ..core.enums import PrimitiveKind, Scene
 from ..core.models import (ActorBinding, BattlePlan, BattleState, CardPick, InitialFormation,
@@ -43,7 +44,11 @@ _POLL_FREEZE_MS = 2000
 # 每次选卡后的固定间隔，等待卡牌选中态渲染
 _PICK_DELAY_S = 0.3
 # 主战斗界面首次出现后，等待技能 CD 数字渲染完成再重新截图感知。
-_MAIN_BATTLE_SETTLE_S = 1.0
+_MAIN_BATTLE_SETTLE_S = 0.25
+# 施放技能点击后等待弹窗/覆盖层出现的短暂间隔
+_SKILL_POST_CLICK_DELAY_S = 0.2
+# 轮询等待间隔（秒）
+_POLL_INTERVAL_S = 0.2
 _NP_GLARE_MAX_FRAMES = 3
 
 # —— 等待上限（秒）：安卓为慢速 OCR 留余量；识别成功立即继续 ——
@@ -80,17 +85,20 @@ class AutoBattleRuntime:
     roster_servant_ids: tuple[str | None, ...] = (None,) * 6
     candidate_servant_ids: tuple[str | None, ...] = ()
     servant_recognizer = None
+    fga_fast: bool = True
 
     def __init__(self, context, controller, decider: Decider, profile: StrategyProfile,
                  battle_policy: BattlePolicy | None = None, *,
                  initial_formation: InitialFormation | None = None,
                  formation_battle: int = 1,
-                 roster_servant_ids: tuple[str | None, ...] | None = None) -> None:
+                 roster_servant_ids: tuple[str | None, ...] | None = None,
+                 fga_fast: bool = True) -> None:
         self.ctx = context
         self.controller = controller
         self.decider = decider
         self.profile = profile
         self.battle_policy = battle_policy or BattlePolicy()
+        self.fga_fast = bool(fga_fast)
         # 这是初始编队证据，不参与当前回合 owner_slot 或换人/退场推断。
         self.initial_formation = initial_formation
         self.initial_formation_reused = (
@@ -142,10 +150,23 @@ class AutoBattleRuntime:
             "[AutoBattle] roster_servant_ids="
             f"{tuple(self.roster_servant_ids)}; 卡牌归属缺证据时保持 unknown"
         )
-        mfaalog.info(f"[AutoBattle] run() start, max_turns={self.profile.max_turns}")
+        fga_enabled = bool(getattr(self, "fga_fast", True))
+        mode_label = "⚡FGA极速模式" if fga_enabled else "🐢原版模式(Pre-FGA)"
+        mfaalog.info(f"[AutoBattle] run() start, max_turns={self.profile.max_turns}, engine={mode_label}")
+        t_battle_start = time.perf_counter()
         turns = 0
         plan_turn = 0
         opening_waits = 0
+        total_main_ms = 0.0
+        total_skills_ms = 0.0
+        total_open_cards_ms = 0.0
+        total_pick_cards_ms = 0.0
+        total_active_ms = 0.0
+        total_anim_ms = 0.0
+        turn_main_ms = 0.0
+        turn_skills_ms = 0.0
+        turn_skills_count = 0
+        turn_open_click_ms = 0.0
         native = self.battle_policy.card.native_strategy
         opening = native.opening_hand
         opening_pending = native.enabled and opening.enabled
@@ -160,11 +181,27 @@ class AutoBattleRuntime:
             return BattleResult.fail("invalid_opening_hand_config_or_missing_plan", turns)
         while turns < self.profile.max_turns:
             self._turn_index = plan_turn
+            t_obs0 = time.perf_counter()
             state = self._observe(settle_main=True)
+            obs_elapsed_ms = (time.perf_counter() - t_obs0) * 1000.0
             scene = state.scene
             mfaalog.info(f"[AutoBattle] Turn {turns+1} | scene={scene.name} | unknown={state.unknown_fields}")
 
             if scene is Scene.VICTORY:
+                if turns > 0:
+                    battle_wall_s = time.perf_counter() - t_battle_start
+                    summary_msg = (
+                        f"[战斗耗时对比] 结算汇总 ({mode_label}): 共 {turns} 回合 | "
+                        f"累计主界面感知={total_main_ms:.0f}ms | "
+                        f"累计技能阶段={total_skills_ms:.0f}ms | "
+                        f"累计展开识卡={total_open_cards_ms:.0f}ms | "
+                        f"累计选卡点击={total_pick_cards_ms:.0f}ms | "
+                        f"累计纯操作总耗时={total_active_ms/1000.0:.2f}s (不含攻击动画) | "
+                        f"累计攻击动画等待={total_anim_ms/1000.0:.2f}s | "
+                        f"场内整场总耗时={battle_wall_s:.2f}s"
+                    )
+                    mfaalog.info(summary_msg)
+                    setattr(self, "_last_battle_summary", summary_msg)
                 # 战斗已胜。结算多屏（奖励/好友申请/连续出击等）不在 Python 侧处理，
                 # 由 pipeline 的 结束战斗_* 节点家族负责推进（见 原生自动战斗调度.json）。
                 mfaalog.info(f"[AutoBattle] Victory! turns={turns} -> settlement handled by pipeline")
@@ -191,6 +228,7 @@ class AutoBattleRuntime:
                         return BattleResult.fail("opening_hand_open_confirm_failed", turns)
                     opening_preview_started = True
                     continue
+                turn_main_ms = obs_elapsed_ms
                 mfaalog.info("[AutoBattle] MAIN_BATTLE -> deciding skills...")
                 action = self.decider.decide(state, turn_index=plan_turn)
                 action, skipped_skills = skip_unusable_servant_skills(
@@ -210,6 +248,7 @@ class AutoBattleRuntime:
                         f"原因：{verdict.reason}"
                     )
 
+                t_skills0 = time.perf_counter()
                 if action.target_enemy is not None:
                     enemy = next(
                         (
@@ -242,18 +281,30 @@ class AutoBattleRuntime:
                                 "[自动战斗] 未能确认敌方目标已选中，继续当前战斗。"
                             )
 
+                seq_for_count = action.skill_sequence or (
+                    *action.servant_skills, *action.master_skills,
+                    *((action.order_change,) if action.order_change is not None else ()),
+                )
+                turn_skills_count = len(seq_for_count)
                 if not self._execute_skills(action):
                     return BattleResult.fail("skill_execution_failed", turns)
+                turn_skills_ms = (time.perf_counter() - t_skills0) * 1000.0
 
                 mfaalog.info("[AutoBattle] MAIN_BATTLE -> opening command cards (click attack)")
+                t_open0 = time.perf_counter()
                 opened = False
+                open_cards_timeout = (
+                    2.5
+                    if (fga_enabled and callable(getattr(self.ctx, "run_recognition", None)))
+                    else _OPEN_CARDS_TIMEOUT_S
+                )
                 for attempt in range(1, _OPEN_CARDS_RETRY + 1):
                     self._mark_action("open_command_cards")
                     if not self.executor.open_command_cards():
                         mfaalog.info(f"[AutoBattle] open_command_cards failed. turns={turns}")
                         return BattleResult.fail("open_cards_failed", turns)
                     mfaalog.info("[AutoBattle] command cards clicked, confirming command selection scene...")
-                    if self._wait_until((Scene.COMMAND_SELECTION,), _OPEN_CARDS_TIMEOUT_S):
+                    if self._wait_until((Scene.COMMAND_SELECTION,), open_cards_timeout):
                         opened = True
                         break
                     # 竞态防护：技能覆盖层收尾时主界面模板会弱命中（如 0.82），
@@ -269,6 +320,7 @@ class AutoBattleRuntime:
                 if not opened:
                     mfaalog.info("[AutoBattle] command selection confirmation failed; stopping safely")
                     return BattleResult.fail("open_cards_confirm_failed", turns)
+                turn_open_click_ms = (time.perf_counter() - t_open0) * 1000.0
                 mfaalog.info("[AutoBattle] command cards opened and confirmed")
                 continue
 
@@ -301,9 +353,11 @@ class AutoBattleRuntime:
                 if waiting_action is None and not self._check_card_actor_bindings():
                     return BattleResult.fail("card_actor_identity_mismatch", turns)
                 mfaalog.info(f"[AutoBattle] ========== Turn {turns+1} ==========")
+                t_pick0 = time.perf_counter()
                 self._selection_cards = state.cards
                 cards_text = " | ".join(
                     f"卡{card.ui_slot}:{servant_name(card.owner_servant_id)}/{card.color.value}"
+                    f"[克制={getattr(getattr(card, 'affinity', None), 'value', 'normal')}]"
                     f"(前排{card.owner_slot or '?'},归属{card.owner_confidence.value:.3f},"
                     f"分差{card.owner_margin:.3f},{'可攻击' if card.can_attack else '封印/无法行动'})"
                     for card in state.cards
@@ -347,12 +401,32 @@ class AutoBattleRuntime:
                 if not self._execute_selection(action):
                     mfaalog.info("[AutoBattle] Execution failed (confirmation error).")
                     return BattleResult.fail("selection_confirm_failed", turns)
+                pick_cards_ms = (time.perf_counter() - t_pick0) * 1000.0
+                open_cards_ms = turn_open_click_ms + obs_elapsed_ms
+                turn_active_ms = turn_main_ms + turn_skills_ms + open_cards_ms + pick_cards_ms
+                total_main_ms += turn_main_ms
+                total_skills_ms += turn_skills_ms
+                total_open_cards_ms += open_cards_ms
+                total_pick_cards_ms += pick_cards_ms
+                total_active_ms += turn_active_ms
+                mfaalog.info(
+                    f"[战斗耗时对比][FGA极速 vs 原版] 当前={mode_label} | 第{turns+1}回合 | "
+                    f"主界面感知={turn_main_ms:.0f}ms | 技能阶段({turn_skills_count}项)={turn_skills_ms:.0f}ms | "
+                    f"展开选卡+识卡={open_cards_ms:.0f}ms | 选卡点击={pick_cards_ms:.0f}ms | "
+                    f"本回合操作总耗时={turn_active_ms:.0f}ms"
+                )
+                turn_main_ms = 0.0
+                turn_skills_ms = 0.0
+                turn_skills_count = 0
+                turn_open_click_ms = 0.0
                 mfaalog.info("[AutoBattle] Picks executed, waiting for attack animation to settle...")
                 # 选完第 3 张自动发动 -> 等动画结束
+                t_anim0 = time.perf_counter()
                 if not self._wait_turn_settled():
                     reason = getattr(self, "_post_attack_failure_reason", "stuck_after_attack")
                     mfaalog.error(f"[AutoBattle] 出卡后等待失败: {reason}；保留当前画面停止。 turns={turns}")
                     return BattleResult.fail(reason, turns)
+                total_anim_ms += (time.perf_counter() - t_anim0) * 1000.0
                 if self._post_attack_returned_to_map:
                     # 剧情后直接返回地图的关卡没有普通结算；交回调用方复核，
                     # 不将剧情按钮本身视为胜利，也不进入下一回合。
@@ -419,8 +493,33 @@ class AutoBattleRuntime:
         action = RuleDecider(recovery).decide(state)
         return replace(action, rationale_tag="opening_hand:wait_without_skills_or_np")
 
-    def _observe(self, *, settle_main: bool = False, enemy_slots=None):
+    @staticmethod
+    def _perception_supports_skip_skill_cd() -> bool:
+        target = perception.build
+        side_effect = getattr(target, "side_effect", None)
+        if callable(side_effect):
+            target = side_effect
+        try:
+            params = inspect.signature(target).parameters
+        except (TypeError, ValueError):
+            return False
+        return "skip_skill_cd" in params
+
+    @staticmethod
+    def _perception_supports_fga_fast() -> bool:
+        target = perception.build
+        side_effect = getattr(target, "side_effect", None)
+        if callable(side_effect):
+            target = side_effect
+        try:
+            params = inspect.signature(target).parameters
+        except (TypeError, ValueError):
+            return False
+        return "fga_fast" in params
+
+    def _observe(self, *, settle_main: bool = False, enemy_slots=None, skip_skill_cd: bool = False):
         mfaalog.diagnostic("[AutoBattle] _observe() -> post_screencap")
+        fga_enabled = bool(getattr(self, "fga_fast", True))
         img = self.controller.post_screencap().wait().get()
         scene = perception.detect_scene(self.ctx, img) if settle_main else None
         if scene is Scene.MAIN_BATTLE:
@@ -434,7 +533,13 @@ class AutoBattleRuntime:
             # The upper NP cards finish appearing after the five face cards.
             # Keep the timing in the native pipeline rather than using NP bars
             # to predict cards that are not yet visible.
-            detail = self.ctx.run_task("战斗_选卡展开等待")
+            if fga_enabled:
+                detail = self.ctx.run_task(
+                    "战斗_选卡展开等待",
+                    pipeline_override={"战斗_选卡展开等待": {"post_delay": 400}},
+                )
+            else:
+                detail = self.ctx.run_task("战斗_选卡展开等待")
             if not (detail and detail.status.succeeded):
                 raise RuntimeError("command_card_settle_failed")
             img = self.controller.post_screencap().wait().get()
@@ -450,6 +555,10 @@ class AutoBattleRuntime:
         if enemy_slots is not None:
             # 目标复核仍取新截图，只省去另外两个无关敌人的 OCR。
             perception_args["enemy_slots"] = enemy_slots
+        if fga_enabled and (skip_skill_cd or self._has_active_plan()) and self._perception_supports_skip_skill_cd():
+            perception_args["skip_skill_cd"] = True
+        if not fga_enabled and self._perception_supports_fga_fast():
+            perception_args["fga_fast"] = False
         result = perception.build(self.ctx, img, **perception_args)
         for frame_index in range(1, _NP_GLARE_MAX_FRAMES):
             uncertain = tuple(field for field in getattr(result, "unknown_fields", ())
@@ -473,7 +582,10 @@ class AutoBattleRuntime:
             mfaalog.error(f"[NPGlare] {_NP_GLARE_MAX_FRAMES}帧仍无法确认 {unresolved}，保留选卡现场停止")
             raise RuntimeError("np_glare_unresolved")
         if result.scene is Scene.MAIN_BATTLE and any(candidates):
-            self._update_frontline(result.servants)
+            # enemy_slots 仅用于技能间快速选敌复核，截图可能处于前序技能残影中；
+            # 此时不覆写已确认的 roster_servant_ids，防止残影帧将正常在场从者清空为 None。
+            if not (fga_enabled and enemy_slots is not None):
+                self._update_frontline(result.servants)
 
         # 当前回合有 Chaldea 计划时：技能 CD 检测无意义（计划已精确指定何时放技能），
         # 且 ColorMatch ROI 可能因分辨率/缩放偏移导致误判为 CD。
@@ -632,7 +744,10 @@ class AutoBattleRuntime:
         while time.monotonic() < deadline:
             if self.ctx.tasker.stopping:
                 return False
-            state = self._observe(enemy_slots=(slot,))
+            try:
+                state = self._observe(enemy_slots=(slot,), skip_skill_cd=True)
+            except TypeError:
+                state = self._observe(enemy_slots=(slot,))
             if self.ctx.tasker.stopping:
                 return False
             enemy = next((e for e in state.enemies if e.slot == slot and e.alive), None)
@@ -642,7 +757,7 @@ class AutoBattleRuntime:
                     and enemy.confidence.passes(self.profile.min_enemy_confidence)):
                 mfaalog.info(f"[AutoBattle] enemy {slot} target confirmed")
                 return True
-            time.sleep(0.5)
+            time.sleep(_POLL_INTERVAL_S)
         mfaalog.info(f"[AutoBattle] enemy {slot} target confirmation timed out")
         return False
 
@@ -781,6 +896,7 @@ class AutoBattleRuntime:
                     sk.target_ally,
                     (Scene.ORDER_CHANGE, Scene.MAIN_BATTLE) if next_is_swap else (Scene.MAIN_BATTLE,),
                     _MASTER_SKILL_RETURN_TIMEOUT_S if next_is_swap else _SKILL_ANIM_TIMEOUT_S,
+                    skill=sk,
                 ):
                     return False
                 continue
@@ -1014,9 +1130,92 @@ class AutoBattleRuntime:
                 kept.append(branch)
         return {self._SPECIAL_SKILL_PIPELINE: {"next": kept}}
 
+    def _fga_skill_cast_override(self, *, skill, target_ally) -> dict:
+        """FGA 级快速技能释放与分支裁剪：在有固定计划或已知技能身份时消除冗余 OCR。
+
+        保持 _special_skill_pipeline_override() 无参方法契约不变，仅在 _execute_skill_cast
+        实际施放技能时叠加智能裁剪与快速目标选择。
+        """
+        if skill is None or not getattr(self, "fga_fast", True):
+            return {}
+        has_plan = self._has_active_plan()
+        plan = getattr(self.decider, "plan", None)
+        use_choices = (isinstance(skill, ServantSkillAction) and isinstance(plan, BattlePlan)
+                       and plan.special_choices.configured and 0 <= self._turn_index < len(plan.turns))
+
+        known_sid: str | None = None
+        is_master = isinstance(skill, MasterSkillAction)
+        is_special_skill = False
+        if isinstance(skill, ServantSkillAction):
+            actor_sid = getattr(getattr(skill, "actor", None), "servant_id", None)
+            roster = getattr(self, "roster_servant_ids", ()) or ()
+            slot_sid = (roster[skill.servant_slot - 1]
+                        if is_slot(skill.servant_slot, 1, len(roster)) else None)
+            if slot_sid is None:
+                sem_roster = self._semantic_roster()
+                if is_slot(skill.servant_slot, 1, len(sem_roster)):
+                    slot_sid = sem_roster[skill.servant_slot - 1]
+            known_sid = canonical_servant_id(actor_sid or slot_sid)
+            if known_sid is not None:
+                is_special_skill = any(
+                    canonical_servant_id(sid) == known_sid and skill.skill_index in group.skills
+                    for group in SPECIAL_SKILL_GROUPS
+                    for sid in group.servant_ids
+                )
+            else:
+                # 未知从者身份时保守视为可能触发专属多选菜单
+                is_special_skill = True
+
+        result: dict = {}
+
+        # 第一层优化：当整队级 scope 未启用时，按当前单个技能的身份精确裁剪专属从者分支
+        if getattr(self, "_special_skill_servant_ids", None) is None and (is_master or known_sid is not None):
+            get_node_data = getattr(self.ctx, "get_node_data", None)
+            if callable(get_node_data):
+                try:
+                    node = get_node_data(self._SPECIAL_SKILL_PIPELINE) or {}
+                except Exception:
+                    node = {}
+                owners = (node.get("attach") or {}).get("special_skill_servant_ids")
+                branches = node.get("next")
+                if isinstance(owners, dict) and isinstance(branches, list):
+                    common = {*self._SKILL_SKIP_BRANCHES, self._SKILL_TARGET_BRANCH, self._SKILL_NO_OVERLAY_BRANCH}
+                    kept = []
+                    for branch in branches:
+                        name = branch.get("name") if isinstance(branch, dict) else branch
+                        ids = owners.get(name) if isinstance(name, str) else None
+                        if not isinstance(name, str) or name in common or not isinstance(ids, list) or not ids:
+                            kept.append(branch)
+                            continue
+                        if is_master:
+                            continue
+                        normalized = tuple(canonical_servant_id(sid) for sid in ids)
+                        if any(sid is None for sid in normalized) or (
+                            known_sid in normalized and is_special_skill
+                        ):
+                            kept.append(branch)
+                    result[self._SPECIAL_SKILL_PIPELINE] = {"next": kept}
+
+        # 第二层优化（FGA 快速选人与无覆盖层跳过）：
+        # - 无目标技能（target_ally is None）：直接 DirectHit 命中「无覆盖层」，省去全部弹窗/子屏 OCR；
+        # - 带己方目标技能（target_ally in 1..3）：仅保留「战斗_技能目标子屏」与「无覆盖层」，
+        #   并缩短「战斗_技能目标子屏」超时为 350ms：若该技能实际需要选人，350ms 内确认『请选择对象』子屏并点击目标从者；
+        #   若该技能是全队/自身 buff（不弹子屏），350ms 即落入「无覆盖层」而不空等 3000ms。
+        if has_plan and not use_choices and (is_master or (known_sid is not None and not is_special_skill)):
+            if target_ally is not None and is_slot(target_ally, 1, 3):
+                result[self._SPECIAL_SKILL_PIPELINE] = {
+                    "timeout": 350,
+                    "next": [self._SKILL_TARGET_BRANCH, self._SKILL_NO_OVERLAY_BRANCH],
+                }
+            elif target_ally is None:
+                # 无目标技能：直接 DirectHit 命中「无覆盖层」，省去全部弹窗/子屏 OCR
+                result[self._SPECIAL_SKILL_PIPELINE] = {"next": [self._SKILL_NO_OVERLAY_BRANCH]}
+
+        return result
+
     def _execute_skill_cast(self, label, cast_callable, target_ally, return_scenes, return_timeout,
                             default_target: int = 1, *, skill=None):
-        """通用技能执行核：cast → sleep 0.6s → 子流水线处理特殊覆盖层 → 等回主界面。
+        """通用技能执行核：cast → sleep _SKILL_POST_CLICK_DELAY_S → 子流水线处理特殊覆盖层 → 等回主界面。
 
         特殊覆盖层（弹窗/目标选择/专属技能流程）的识别与点击已下沉到
         自动战斗_特殊技能.json，next 列表按序识别自动路由。
@@ -1024,17 +1223,28 @@ class AutoBattleRuntime:
         """
         self._mark_action(label)
         cast_callable()
-        time.sleep(0.6)
+        time.sleep(_SKILL_POST_CLICK_DELAY_S)
         # 子流水线：处理技能点击后可能出现的特殊覆盖层
         # 注意：选从者1/2/3 均为 DirectHit 节点（必命中），必须显式禁用
         # 未选中的两个节点，否则 next 列表按序识别永远先命中「选从者1」
         target = target_ally if target_ally is not None else default_target
+        fga_enabled = bool(getattr(self, "fga_fast", True))
+        selected_slot_override = (
+            {"post_wait_freezes": 0, "post_delay": 150} if fga_enabled else {}
+        )
         override = {
             f"{self._SKILL_TARGET_BRANCH}_选从者{slot}": (
-                {} if slot == target else {"enabled": False}
+                dict(selected_slot_override) if slot == target else {"enabled": False}
             )
             for slot in (1, 2, 3)
         }
+        if fga_enabled:
+            override[self._SPECIAL_SKILL_PIPELINE] = {"post_delay": 150}
+        for key, value in self._fga_skill_cast_override(skill=skill, target_ally=target_ally).items():
+            if isinstance(value, dict) and isinstance(override.get(key), dict):
+                override[key] = {**override[key], **value}
+            else:
+                override[key] = value
         try:
             entry = (self._run_special_skill_pipeline(override, skill=skill) if skill is not None
                      else self._run_special_skill_pipeline(override))
@@ -1048,6 +1258,10 @@ class AutoBattleRuntime:
             mfaalog.info("[AutoBattle] skill cast directly (no overlay); waiting main battle")
         elif entry is not None:
             mfaalog.info(f"[AutoBattle] special skill branch '{entry}' executed")
+            if fga_enabled and callable(getattr(self.ctx, "run_recognition", None)):
+                # 选人子屏点击后约 150~350ms 弹窗正在关闭、技能动画尚未隐藏主界面 Attack 按钮，
+                # 补齐短暂过渡等待，防止 _wait_until 截到弹窗关闭瞬间的主界面残影帧而吞掉后续点击。
+                time.sleep(0.35)
         return self._wait_until(return_scenes, return_timeout, tap_close=True)
 
     def _run_special_skill_pipeline(self, pipeline_override=None, *, skill=None):
@@ -1063,7 +1277,11 @@ class AutoBattleRuntime:
                        and plan.special_choices.configured and 0 <= self._turn_index < len(plan.turns))
         try:
             override = self._special_skill_pipeline_override()
-            override.update(pipeline_override or {})
+            for key, value in (pipeline_override or {}).items():
+                if isinstance(value, dict) and isinstance(override.get(key), dict):
+                    override[key] = {**override[key], **value}
+                else:
+                    override[key] = value
             if use_choices:
                 dispatcher = getattr(self, "_special_choice_dispatcher", None)
                 if dispatcher is None:
@@ -1152,6 +1370,23 @@ class AutoBattleRuntime:
             scene = (perception.detect_scene(self.ctx, img) if Scene.ORDER_CHANGE in scenes
                      else perception.detect_scene(self.ctx, img, check_order_change=False))
             if scene in scenes:
+                # 在 FGA 模式下等待回 MAIN_BATTLE 时，若 context 支持真实 run_recognition，
+                # 复核主界面模板置信度是否达到 min_scene_confidence (0.95)，
+                # 防止技能覆盖层淡出中途的半透明帧（如 0.72~0.84）过早结束等待导致下一技能或攻击点击被吞。
+                if (
+                    bool(getattr(self, "fga_fast", True))
+                    and scene is Scene.MAIN_BATTLE
+                    and scenes == (Scene.MAIN_BATTLE,)
+                    and callable(getattr(self.ctx, "run_recognition", None))
+                ):
+                    profile = getattr(self, "profile", None)
+                    min_conf = getattr(profile, "min_scene_confidence", 0.95)
+                    r = self.ctx.run_recognition("战斗_主界面", img)
+                    best = getattr(r, "best_result", None) if r else None
+                    score = getattr(best, "score", None)
+                    if isinstance(score, (int, float)) and float(score) < min_conf:
+                        time.sleep(_POLL_INTERVAL_S)
+                        continue
                 mfaalog.diagnostic(f"[AutoBattle] _wait_until() matched scene={scene.name}")
                 return True
             if command_selection_timeout_s is not None and scene is Scene.COMMAND_SELECTION:
@@ -1198,6 +1433,6 @@ class AutoBattleRuntime:
             # 默认点击右上角推进奖励等界面；实际剧情由前面的分支按开关处理。
             if tap_close and not story_seen:
                 self.executor.tap_top_right_close()
-            time.sleep(0.5)
+            time.sleep(0.5 if handle_story else _POLL_INTERVAL_S)
         mfaalog.info(f"[AutoBattle] _wait_until() timed out")
         return False

@@ -18,7 +18,7 @@ from __future__ import annotations
 from itertools import permutations
 from typing import List, Protocol, Tuple
 
-from .enums import CardColor, PrimitiveKind, Scene
+from .enums import CardAffinity, CardColor, PrimitiveKind, Scene
 from .models import (BattleAction, BattlePlan, BattleState, CardPick,
                      CommandCard, ServantSkillAction, TurnPlan, is_slot)
 from .policy import BattlePolicy, CardPolicy, Goal, SkillPolicy
@@ -249,6 +249,7 @@ def _native_card_score(
     colors: list[CardColor | None] = []
     owners: list[int | None] = []
     identities: list[str | None] = []
+    affinities: list[CardAffinity] = []
     attackable = known_colors = 0
     for pick in picks:
         if pick.kind is PrimitiveKind.SELECT_CARD:
@@ -256,6 +257,7 @@ def _native_card_score(
             colors.append(card.color if card.color is not CardColor.UNKNOWN else None)
             owners.append(card.owner_slot if is_slot(card.owner_slot, 1, 3) else None)
             identities.append(card.owner_servant_id)
+            affinities.append(card.affinity)
             attackable += int(card.can_attack)
             known_colors += int(card.color is not CardColor.UNKNOWN)
         else:
@@ -266,9 +268,15 @@ def _native_card_score(
                                            np_slot_colors.get(card.servant_slot)))
             owners.append(card.servant_slot)
             identities.append(card.owner_servant_id)
+            affinities.append(CardAffinity.NORMAL)
 
     n = len(picks)
     score = sum(weights.get(color, 0) * (n - pos) for pos, color in enumerate(colors))
+    for pos, affinity in enumerate(affinities):
+        if affinity is CardAffinity.WEAK:
+            score += native.weak_weight * (n - pos)
+        elif affinity is CardAffinity.RESIST:
+            score -= native.resist_penalty * (n - pos)
     goal_color = _GOAL_COLOR.get(policy.goal)
     color_set = set(colors)
     if n == 3 and None not in color_set:
@@ -373,6 +381,10 @@ def _best_face_order(
         n = len(seq)
         for pos, card in enumerate(seq):
             s += weights.get(card.color, 0) * (n - pos)      # 靠前的卡权重更高
+            if card.affinity is CardAffinity.WEAK:
+                s += policy.weak_weight * (n - pos)
+            elif card.affinity is CardAffinity.RESIST:
+                s -= policy.resist_penalty * (n - pos)
         colors = {c.color for c in seq}
         if len(colors) == 1 and CardColor.UNKNOWN not in colors:  # 已识别的同色链
             s += 5.0

@@ -117,8 +117,10 @@ class AutoBattleAction(CustomAction):
             mfaalog.warning("[auto_battle] 编队已重置：丢弃旧方案，使用不依赖旧身份的高级策略")
         plan = _parse_plan(param)
         chaldea_roster = None
+        fga_fast = True
         try:
             strategy_attach = _attached_strategy_settings(context, node_name)
+            fga_fast = strategy_attach.get("native_battle_fga_fast", param.get("fga_fast", True)) is not False
             source_mode = strategy_attach.get("native_battle_strategy_source")
             trial_node = (context.get_node_data(node_name) or {}) if node_name else {}
             trial_requested = ((trial_node.get("attach") or {}).get("native_battle_trial_profile")
@@ -169,14 +171,26 @@ class AutoBattleAction(CustomAction):
         plan_turns = len(plan.turns) if plan is not None else 0
         mfaalog.info(
             f"[auto_battle] start profile={profile.id} "
-            f"max_turns={profile.max_turns} plan={plan_status} plan_turns={plan_turns}"
+            f"max_turns={profile.max_turns} plan={plan_status} plan_turns={plan_turns} "
+            f"fga_fast={fga_fast}"
         )
         try:
-            result = runtime_class(
+            rt = runtime_class(
                 context, controller, decider, profile, battle_policy,
                 initial_formation=initial_formation, formation_battle=formation_battle,
-                roster_servant_ids=roster_servant_ids,
-            ).run()
+                roster_servant_ids=roster_servant_ids, fga_fast=fga_fast,
+            )
+            result = rt.run()
+            last_summary = getattr(rt, "_last_battle_summary", None)
+            if last_summary:
+                try:
+                    context.override_pipeline({
+                        "原生自动战斗-高级策略配置": {
+                            "attach": {"last_battle_summary": last_summary}
+                        }
+                    })
+                except Exception:
+                    pass
         except Exception:
             if token and sessions.valid(root, token):
                 sessions.invalidate(root, token, "battle_runtime_exception")

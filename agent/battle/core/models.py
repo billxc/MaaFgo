@@ -12,7 +12,7 @@ from .special_skills import SpecialSkillChoices
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-from .enums import CardColor, PrimitiveKind, Scene
+from .enums import CardAffinity, CardColor, PrimitiveKind, Scene
 
 SCHEMA_VERSION = 2
 
@@ -112,6 +112,7 @@ class CommandCard:
     owner_reason: str = ""
     can_attack: bool = True          # 封印/无法行动的面卡仍可选作回合占位
     blocked_reason: str = ""
+    affinity: CardAffinity = CardAffinity.NORMAL
 
 
 @dataclass(frozen=True)
