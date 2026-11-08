@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "agent"), str(ROOT / "agent/custom")]
-from battle.core.models import FormationSlot, InitialFormation
+from battle.core.models import (ActorBinding, BattlePlan, FormationSlot, InitialFormation,
+                                MasterSkillAction, ServantSkillAction, TurnPlan)
 from battle.core.policy import StrategyProfile
 from battle.runtime.runtime import AutoBattleRuntime
 
@@ -175,6 +176,38 @@ class SpecialSkillScopeTests(unittest.TestCase):
             self.assertIn(name, PIPELINE)
             self.assertTrue(ids)
             self.assertTrue(all(isinstance(sid, str) and sid.isdecimal() and int(sid) > 0 for sid in ids))
+
+    def test_fast_skill_cast_override_prunes_special_branches_and_ocr_for_planned_normal_skills(self):
+        r = runtime(roster=("100100", "1100900", "200100", None, None, None))
+        r.decider = NS(plan=BattlePlan(turns=(TurnPlan(),)))
+        r._turn_index = 0
+        # 1. 有计划的普通从者无目标技能：直接走无覆盖层 DirectHit，0 OCR
+        normal_no_target = ServantSkillAction(1, 1, actor=ActorBinding(0, "100100"))
+        ov1 = r._fast_skill_cast_override(skill=normal_no_target, target_ally=None)
+        self.assertEqual(ov1[ENTRY]["next"], ["战斗_特殊技能_无覆盖层"])
+
+        # 2. 有计划的普通从者指定己方目标技能：裁剪掉所有无关弹窗和专属分支，仅保留「战斗_技能目标子屏」与「战斗_特殊技能_无覆盖层」
+        normal_with_target = ServantSkillAction(1, 2, target_ally=3, actor=ActorBinding(0, "100100"))
+        ov2 = r._fast_skill_cast_override(skill=normal_with_target, target_ally=3)
+        self.assertEqual(ov2[ENTRY]["next"], ["战斗_技能目标子屏", "战斗_特殊技能_无覆盖层"])
+        self.assertEqual(ov2[ENTRY]["timeout"], 350)
+
+        # 3. 有计划的御主技能（带目标 / 无目标）：同样走快速路径
+        master_with_target = MasterSkillAction(1, target_ally=2)
+        ov3 = r._fast_skill_cast_override(skill=master_with_target, target_ally=2)
+        self.assertEqual(ov3[ENTRY]["next"], ["战斗_技能目标子屏", "战斗_特殊技能_无覆盖层"])
+        self.assertEqual(ov3[ENTRY]["timeout"], 350)
+
+        master_no_target = MasterSkillAction(2)
+        ov4 = r._fast_skill_cast_override(skill=master_no_target, target_ally=None)
+        self.assertEqual(ov4[ENTRY]["next"], ["战斗_特殊技能_无覆盖层"])
+
+        # 4. 仇凛 2 技能（特殊多选技能）：保留其专属分支与常规检测，不跳过菜单识别
+        ishtar_s2 = ServantSkillAction(2, 2, actor=ActorBinding(1, "1100900"))
+        ov5 = r._fast_skill_cast_override(skill=ishtar_s2, target_ally=None)
+        self.assertIn("战斗_仇凛2技能_色卡选择", ov5[ENTRY]["next"])
+        self.assertNotIn(ASH, ov5[ENTRY]["next"])
+        self.assertNotIn("战斗_技能目标子屏", ov5)
 
 
 if __name__ == "__main__":
